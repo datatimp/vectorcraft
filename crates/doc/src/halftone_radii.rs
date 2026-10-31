@@ -1,6 +1,7 @@
 //! Color Halftone's Max Radius was a distance in points until documents of version 2; since then
 //! it is in pixels of the Document Raster Effects resolution, as public documentation gives it
-//! (#3260). [`Document::migrate_halftone_radii`] converts the radii of older documents.
+//! (#3260). [`Document::migrate_halftone_radii`] converts the radii of older documents, and
+//! [`Document::halftone_radii_to_points`] converts them back for a file saved for an older app.
 
 use std::sync::Arc;
 
@@ -30,14 +31,34 @@ impl Document {
         }
         self.version = FORMAT_VERSION;
         let k = self.raster_ppi() / 72.0;
-        let fix = &mut |e: &mut Effect| to_pixels(e, k);
+        self.each_halftone(&mut |e| rescale(e, k));
+    }
+
+    /// For a file saved for an app before version 2 (every native file version before today's):
+    /// each Color Halftone's Max Radius in pixels becomes the points that draw the same dots,
+    /// within the 4 to 127 pt that app takes (a radius under 4 pt, from a fine screen at a high
+    /// resolution, draws bigger dots there), and the document becomes version 1, so reopening the
+    /// file here converts them back.
+    pub fn halftone_radii_to_points(&mut self) {
+        if self.version < PIXEL_RADII_SINCE {
+            return;
+        }
+        self.version = PIXEL_RADII_SINCE - 1;
+        let k = 72.0 / self.raster_ppi();
+        self.each_halftone(&mut |e| rescale(e, k));
+    }
+
+    /// `fix` each effect in the art, symbols, patterns (and the one being edited as it was), graph
+    /// designs, opacity masks and graphic styles that use a Color Halftone.
+    fn each_halftone(&mut self, fix: &mut dyn FnMut(&mut Effect)) {
         for l in &mut self.layers {
             node(l, fix);
         }
         for s in &mut self.symbols {
             node(&mut s.art, fix);
         }
-        for p in &mut self.patterns {
+        // Pattern editing is saved with the pattern as it was, which Cancel puts back.
+        for p in self.patterns.iter_mut().chain(self.pattern_edit.iter_mut().filter_map(|pe| pe.original.as_mut())) {
             for a in &mut p.art {
                 node(a, fix);
             }
@@ -53,8 +74,9 @@ impl Document {
     }
 }
 
-/// `e`'s radius in points as pixels, `k` pixels a point, when it is a Color Halftone.
-fn to_pixels(e: &mut Effect, k: f64) {
+/// `e`'s radius times `k` (pixels a point, or points a pixel), within the effect's range, when it
+/// is a Color Halftone. Its default is 8 in either unit.
+fn rescale(e: &mut Effect, k: f64) {
     if e.id != HALFTONE {
         return;
     }
@@ -109,17 +131,17 @@ mod tests {
     fn older_radii_become_the_pixels_that_draw_the_same_dots() {
         for (ppi, pt, px) in [(72.0, 8.0, 8.0), (300.0, 8.0, 33.333333333333336), (300.0, 4.0, 16.666666666666668), (150.0, 127.0, 127.0)] {
             let mut e = halftone(Some(pt));
-            to_pixels(&mut e, ppi / 72.0);
+            rescale(&mut e, ppi / 72.0);
             assert!((radius(&e) - px).abs() < 1e-9, "{pt} pt at {ppi} ppi: {}", radius(&e));
             assert_eq!(e.params["channel1"], json!(108.0), "the angles stay");
         }
         // A radius left out drew at the old default, 8 pt.
         let mut e = halftone(None);
-        to_pixels(&mut e, 300.0 / 72.0);
+        rescale(&mut e, 300.0 / 72.0);
         assert!((radius(&e) - 33.333333333333336).abs() < 1e-9);
         // Other effects keep their parameters.
         let mut blur = Effect { id: "blur.gaussian".into(), params: json!({"radius": 8.0}), visible: true };
-        to_pixels(&mut blur, 300.0 / 72.0);
+        rescale(&mut blur, 300.0 / 72.0);
         assert_eq!(blur.params, json!({"radius": 8.0}));
     }
 
@@ -141,5 +163,42 @@ mod tests {
         let once = d.clone();
         d.migrate_halftone_radii();
         assert_eq!(d, once, "converted documents are left alone");
+    }
+
+    #[test]
+    fn radii_go_back_to_points_for_an_older_app_and_return_unchanged() {
+        let mut d = Document::new(100.0, 100.0);
+        d.raster_effects_ppi = 300.0;
+        let mut style = d.graphic_styles.first().cloned().unwrap();
+        style.appearance.effects.push(halftone(Some(100.0)));
+        style.appearance.effects.push(halftone(Some(4.0)));
+        d.graphic_styles.push(style);
+        let r = |d: &Document, i: usize| d.graphic_styles.last().map(|s| radius(&s.appearance.effects[i])).unwrap();
+        d.halftone_radii_to_points();
+        assert_eq!(d.version, 1, "reopened here, it converts back");
+        assert!((r(&d, 0) - 24.0).abs() < 1e-9, "100 px at 300 ppi is 24 pt: {}", r(&d, 0));
+        assert_eq!(r(&d, 1), 4.0, "0.96 pt is under the 4 pt the older app takes");
+        let points = d.clone();
+        d.halftone_radii_to_points();
+        assert_eq!(d, points, "already in points");
+        d.migrate_halftone_radii();
+        assert!((r(&d, 0) - 100.0).abs() < 1e-9, "{}", r(&d, 0));
+    }
+
+    #[test]
+    fn the_pattern_being_edited_is_converted_as_it_was() {
+        let mut d = Document::new(100.0, 100.0);
+        d.raster_effects_ppi = 300.0;
+        let id = d.alloc_id();
+        let mut look = Appearance::default_art();
+        look.effects = vec![halftone(Some(8.0))];
+        let square = vectorcraft_geom::shapes::rectangle(vectorcraft_geom::Rect::new(0.0, 0.0, 10.0, 10.0));
+        let tile = Arc::new(Node::path(id, square, look));
+        let original = Some(crate::PatternDef::new("Tile", vec![tile]));
+        d.pattern_edit = Some(crate::PatternEdit { pattern: "Tile".into(), layer: crate::NodeId(0), original });
+        d.version = 1;
+        d.migrate_halftone_radii();
+        let art = &d.pattern_edit.as_ref().unwrap().original.as_ref().unwrap().art[0];
+        assert!((radius(&art.appearance.effects[0]) - 33.333333333333336).abs() < 1e-9, "the tile Cancel puts back");
     }
 }

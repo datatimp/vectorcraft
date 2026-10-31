@@ -319,6 +319,10 @@ fn body(doc: &Document, o: &SaveOptions) -> Result<Body, FormatError> {
     if version < 3 {
         d.store_legacy_color_profiles();
     }
+    // Apps before this one's version take Color Halftone's Max Radius in points (#3260).
+    if version < VERSION {
+        d.halftone_radii_to_points();
+    }
     let v1 = if version == 1 {
         let mut v = serde_json::to_value(&d).map_err(encode_err)?;
         legacy::anchors_to_v1(&mut v);
@@ -804,6 +808,19 @@ mod tests {
         let old = load(&save(&d, false)).unwrap();
         assert_eq!(old.version, vectorcraft_doc::FORMAT_VERSION);
         assert!((radius(&old) - 8.0 * 300.0 / 72.0).abs() < 1e-9, "8 pt at 300 ppi: {}", radius(&old));
+        // Saved for an older app, in every older version: the radius in points, which opens here
+        // in pixels again.
+        let px = radius(&old);
+        for version in MIN_VERSION..VERSION {
+            let bytes = save_with(&old, &SaveOptions { version, ..SaveOptions::default() }).unwrap();
+            let json = String::from_utf8(unpack::Unpacked::new(&bytes).unwrap().json().to_vec()).unwrap();
+            let at = json.find("\"maxRadius\":").unwrap() + "\"maxRadius\":".len();
+            let saved: f64 = json[at..].split([',', '}']).next().unwrap().trim().parse().unwrap();
+            assert!((saved - 8.0).abs() < 1e-9, "version {version} holds 8 pt: {saved}");
+            let back = load(&bytes).unwrap();
+            assert!((radius(&back) - px).abs() < 1e-9, "version {version}: {}", radius(&back));
+        }
+        assert_eq!(radius(&old), px, "saving leaves the open document as it is");
     }
 
     #[test]
