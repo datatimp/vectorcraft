@@ -789,38 +789,40 @@ mod tests {
 
     /// Color Halftone's Max Radius is in pixels of the raster effects resolution since document
     /// version 2 (#3260): a file from before opens with its radius in points converted, one saved
-    /// since opens as it was.
+    /// since opens as it was. At 72 ppi a point is a pixel, so the number stays.
     #[test]
     fn halftone_radii_of_older_documents_open_in_pixels() {
-        let mut d = Document::new(100.0, 100.0);
-        d.raster_effects_ppi = 300.0;
-        let (l, id) = (d.layers[0].id, d.alloc_id());
-        let mut look = Appearance::default_art();
-        look.effects.push(vectorcraft_doc::Effect {
-            id: "pixelate.colorHalftone".into(),
-            params: serde_json::json!({"maxRadius": 8.0}),
-            visible: true,
-        });
-        d.insert(Some(l), 0, Node::path(id, shapes::ellipse(Rect::new(0.0, 0.0, 10.0, 10.0)), look)).unwrap();
-        let radius = |d: &Document| d.node(id).unwrap().appearance.effects[0].params["maxRadius"].as_f64().unwrap();
-        assert_eq!(radius(&load(&save(&d, false)).unwrap()), 8.0, "saved in pixels, opened in pixels");
-        d.version = 1;
-        let old = load(&save(&d, false)).unwrap();
-        assert_eq!(old.version, vectorcraft_doc::FORMAT_VERSION);
-        assert!((radius(&old) - 8.0 * 300.0 / 72.0).abs() < 1e-9, "8 pt at 300 ppi: {}", radius(&old));
-        // Saved for an older app, in every older version: the radius in points, which opens here
-        // in pixels again.
-        let px = radius(&old);
-        for version in MIN_VERSION..VERSION {
-            let bytes = save_with(&old, &SaveOptions { version, ..SaveOptions::default() }).unwrap();
-            let json = String::from_utf8(unpack::Unpacked::new(&bytes).unwrap().json().to_vec()).unwrap();
-            let at = json.find("\"maxRadius\":").unwrap() + "\"maxRadius\":".len();
-            let saved: f64 = json[at..].split([',', '}']).next().unwrap().trim().parse().unwrap();
-            assert!((saved - 8.0).abs() < 1e-9, "version {version} holds 8 pt: {saved}");
-            let back = load(&bytes).unwrap();
-            assert!((radius(&back) - px).abs() < 1e-9, "version {version}: {}", radius(&back));
+        for ppi in [72.0, 300.0] {
+            let mut d = Document::new(100.0, 100.0);
+            d.raster_effects_ppi = ppi;
+            let (l, id) = (d.layers[0].id, d.alloc_id());
+            let mut look = Appearance::default_art();
+            look.effects.push(vectorcraft_doc::Effect {
+                id: "pixelate.colorHalftone".into(),
+                params: serde_json::json!({"maxRadius": 8.0}),
+                visible: true,
+            });
+            d.insert(Some(l), 0, Node::path(id, shapes::ellipse(Rect::new(0.0, 0.0, 10.0, 10.0)), look)).unwrap();
+            let radius = |d: &Document| d.node(id).unwrap().appearance.effects[0].params["maxRadius"].as_f64().unwrap();
+            assert_eq!(radius(&load(&save(&d, false)).unwrap()), 8.0, "{ppi} ppi: saved in pixels, opened in pixels");
+            d.version = 1;
+            let old = load(&save(&d, false)).unwrap();
+            assert_eq!(old.version, vectorcraft_doc::FORMAT_VERSION);
+            assert!((radius(&old) - 8.0 * ppi / 72.0).abs() < 1e-9, "8 pt at {ppi} ppi: {}", radius(&old));
+            // Saved for an older app, in every older version: the radius in points, which opens
+            // here in pixels again.
+            let px = radius(&old);
+            for version in MIN_VERSION..VERSION {
+                let bytes = save_with(&old, &SaveOptions { version, ..SaveOptions::default() }).unwrap();
+                let json = String::from_utf8(unpack::Unpacked::new(&bytes).unwrap().json().to_vec()).unwrap();
+                let at = json.find("\"maxRadius\":").unwrap() + "\"maxRadius\":".len();
+                let saved: f64 = json[at..].split([',', '}']).next().unwrap().trim().parse().unwrap();
+                assert!((saved - 8.0).abs() < 1e-9, "{ppi} ppi, version {version} holds 8 pt: {saved}");
+                let back = load(&bytes).unwrap();
+                assert!((radius(&back) - px).abs() < 1e-9, "{ppi} ppi, version {version}: {}", radius(&back));
+            }
+            assert_eq!(radius(&old), px, "{ppi} ppi: saving leaves the open document as it is");
         }
-        assert_eq!(radius(&old), px, "saving leaves the open document as it is");
     }
 
     #[test]
